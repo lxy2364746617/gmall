@@ -1,14 +1,25 @@
 package com.lxy.gmall.manage.service.impl;
 
 import com.alibaba.dubbo.config.annotation.Service;
+import com.alibaba.fastjson.JSON;
 import com.lxy.gmall.bean.*;
+import com.lxy.gmall.config.RedisUtil;
+import com.lxy.gmall.manage.constant.ManageConst;
 import com.lxy.gmall.manage.mapper.*;
 import com.lxy.gmall.service.ManageService;
+import org.apache.commons.lang3.StringUtils;
+import org.redisson.Redisson;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
+import org.redisson.config.Config;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.transaction.annotation.Transactional;
+import redis.clients.jedis.Jedis;
 import tk.mybatis.mapper.entity.Example;
 
+import java.util.Collections;
 import java.util.List;
+import java.util.UUID;
 
 /**
  * @author Chris
@@ -46,6 +57,21 @@ public class ManageServiceImpl implements ManageService {
 
     @Autowired
     private SpuImageMapper spuImageMapper;
+
+    @Autowired
+    private SkuInfoMapper skuInfoMapper;
+
+    @Autowired
+    private SkuImageMapper skuImageMapper;
+
+    @Autowired
+    private  SkuAttrValueMapper skuAttrValueMapper;
+
+    @Autowired
+    private SkuSaleAttrValueMapper skuSaleAttrValueMapper;
+
+    @Autowired
+    private RedisUtil redisUtil;
 
     /**
      * 查询所有一级分类数据
@@ -215,5 +241,102 @@ public class ManageServiceImpl implements ManageService {
      */
     public List<SpuSaleAttr> getSpuSaleAttrList(String spuId) {
         return spuSaleAttrMapper.selectSpuSaleAttrList(spuId);
+    }
+
+    /**
+     * 保存skuinfo
+     * @param skuInfo
+     */
+    @Transactional
+    public void saveSkuInfo(SkuInfo skuInfo) {
+        skuInfoMapper.insertSelective(skuInfo);
+
+        List<SkuImage> skuImageList = skuInfo.getSkuImageList();
+        if(skuImageList != null && skuImageList.size() > 0) {
+            for(SkuImage skuImage : skuImageList ) {
+                skuImage.setSkuId(skuInfo.getId());
+                skuImageMapper.insertSelective(skuImage);
+            }
+        }
+
+        List<SkuAttrValue> skuAttrValueList = skuInfo.getSkuAttrValueList();
+        if(skuAttrValueList != null && skuAttrValueList.size() > 0) {
+            for(SkuAttrValue skuAttrValue : skuAttrValueList) {
+                skuAttrValue.setSkuId(skuInfo.getId());
+                skuAttrValueMapper.insertSelective(skuAttrValue);
+            }
+        }
+
+        List<SkuSaleAttrValue> skuSaleAttrValueList = skuInfo.getSkuSaleAttrValueList();
+        if(skuSaleAttrValueList != null && skuSaleAttrValueList.size() > 0) {
+            for(SkuSaleAttrValue skuSaleAttrValue : skuSaleAttrValueList) {
+                skuSaleAttrValue.setSkuId(skuInfo.getId());
+                skuSaleAttrValueMapper.insertSelective(skuSaleAttrValue);
+            }
+        }
+    }
+
+    public SkuInfo getSkuInfo(String skuId) {
+        SkuInfo skuInfo = null;
+        Jedis jedis = null;
+        try{
+            jedis = redisUtil.getJedis();
+            String skuKey = ManageConst.SKUKEY_PREFIX + skuId + ManageConst.SKUKEY_SUFFIX;
+            String skuJson = jedis.get(skuKey);
+            if(skuJson == null) {
+                System.out.println("准备上锁!");
+                String skuLockKey = ManageConst.SKUKEY_PREFIX + skuId + ManageConst.SKULOCK_SUFFIX;
+                String token = UUID.randomUUID().toString().replace("-", "");
+
+                String lockKey = jedis.set(skuLockKey, token, "nx", "ex", ManageConst.SKULOCK_EXPIRE_PX);
+
+                if("OK".equals(lockKey)) {
+                    System.out.println("获得分布式锁!");
+                    skuInfo = getSkuInfoDB(skuId);
+                    jedis.setex(skuKey, ManageConst.SKUKEY_TIMEOUT, JSON.toJSONString(skuInfo));
+//                    jedis.del(skuLockKey);
+                    String script = "if redis.call('get', KEYS[1]) === ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+                    jedis.eval(script, Collections.singletonList(skuLockKey), Collections.singletonList(token));
+                    return skuInfo;
+                } else {
+                    Thread.sleep(1000);
+                    return getSkuInfo(skuId);
+                }
+            } else {
+                skuInfo = JSON.parseObject(skuJson, SkuInfo.class);
+                return skuInfo;
+            }
+        } catch(Exception e) {
+            e.printStackTrace();
+        } finally {
+            if(jedis != null) {
+                jedis.close();
+            }
+        }
+        return getSkuInfoDB(skuId);
+    }
+
+    public SkuInfo getSkuInfoDB(String skuId) {
+        SkuInfo skuInfo = skuInfoMapper.selectByPrimaryKey(skuId);
+        skuInfo.setSkuImageList(getSkuImageList(skuId));
+        SkuAttrValue skuAttrValue = new SkuAttrValue();
+        skuAttrValue.setSkuId(skuInfo.getId());
+        List<SkuAttrValue> skuAttrValueList = skuAttrValueMapper.select(skuAttrValue);
+        skuInfo.setSkuAttrValueList(skuAttrValueList);
+        return skuInfo;
+    }
+
+    public List<SkuImage> getSkuImageList(String skuId) {
+        SkuImage skuImage = new SkuImage();
+        skuImage.setSkuId(skuId);
+        return skuImageMapper.select(skuImage);
+    }
+
+    public List<SpuSaleAttr> getSpuSaleAttrListCheckBySku(SkuInfo skuInfo) {
+        return spuSaleAttrMapper.selectSpuSaleAttrListCheckBySku(skuInfo.getId(), skuInfo.getSpuId());
+    }
+
+    public List<SkuSaleAttrValue> getSkuSaleAttrValueListBySpu(String spuId) {
+        return skuSaleAttrValueMapper.selectSkuSaleAttrValueListBySpu(spuId);
     }
 }

@@ -30,6 +30,6 @@ public class SkuImage implements Serializable {
     private String spuImgId;
 
     @Column
-    private String idDefault;
+    private String isDefault;
 
 }
